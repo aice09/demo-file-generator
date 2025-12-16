@@ -53,6 +53,19 @@ jobs:
           "${{ inputs.zip_output }}" \
           "${{ inputs.randomize_names }}" \
           "${{ inputs.max_files_limit }}"
+      
+      - name: Validate inputs
+        run: |
+          echo "Validating inputs..."
+          python -c "
+          import sys
+          args = sys.argv[1:]
+          expected_args = 9
+          if len(args) < expected_args:
+              print(f'ERROR: Expected at least {expected_args} arguments, got {len(args)}')
+              sys.exit(1)
+          " "${{ inputs.source_files }}" "${{ inputs.copies }}" "${{ inputs.target_folder }}" "${{ inputs.per_subfolder }}" "${{ inputs.parallel_workers }}" "${{ inputs.dry_run }}" "${{ inputs.zip_output }}" "${{ inputs.randomize_names }}" "${{ inputs.max_files_limit }}"
+                  shell: bash
 
       - name: Upload artifact (ZIP)
         if: inputs.zip_output == 'true' && inputs.dry_run != 'true'
