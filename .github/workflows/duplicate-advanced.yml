@@ -1,0 +1,69 @@
+name: Advanced File Duplicator
+
+
+on:
+workflow_dispatch:
+inputs:
+source_files:
+description: "Comma-separated source file paths"
+required: true
+copies:
+description: "Copies per source file"
+required: true
+target_folder:
+description: "Output folder"
+required: true
+per_subfolder:
+description: "Files per subfolder (0 = none)"
+required: true
+parallel_workers:
+default: "4"
+dry_run:
+default: "false"
+zip_output:
+default: "true"
+randomize_names:
+default: "false"
+max_files_limit:
+default: "50000"
+
+
+jobs:
+generate:
+runs-on: ubuntu-latest
+
+
+steps:
+- uses: actions/checkout@v4
+
+
+- uses: actions/setup-python@v5
+with:
+python-version: "3.11"
+
+
+- name: Install dependencies
+run: pip install tqdm
+
+
+- name: Generate files
+run: |
+python scripts/duplicate_files_advanced.py \
+"${{ inputs.source_files }}" \
+"${{ inputs.copies }}" \
+"${{ inputs.target_folder }}" \
+"${{ inputs.per_subfolder }}" \
+"${{ inputs.parallel_workers }}" \
+"${{ inputs.dry_run }}" \
+"${{ inputs.zip_output }}" \
+"${{ inputs.randomize_names }}" \
+"${{ inputs.max_files_limit }}"
+
+
+- name: Upload artifact (ZIP)
+if: inputs.zip_output == 'true' && inputs.dry_run != 'true'
+uses: actions/upload-artifact@v4
+with:
+name: duplicated-files
+path: |
+${{ inputs.target_folder }}.zip
