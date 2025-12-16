@@ -1,12 +1,4 @@
 import os
-if not copies.isdigit() or int(copies) <= 0:
-error("copies must be > 0")
-
-
-if not per_subfolder.isdigit():
-error("per_subfolder must be numeric")
-
-
 if not workers.isdigit() or int(workers) <= 0:
 error("parallel_workers must be > 0")
 
