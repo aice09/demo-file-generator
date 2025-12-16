@@ -1,198 +1,229 @@
+#!/usr/bin/env python3
+"""
+duplicate_files_cli.py
+
+Pure Python file duplication tool with:
+- Interactive mode OR argparse flags
+- Parallel generation
+- Progress bar with ETA & files/sec
+- Resume support
+- Subfolder splitting
+- ZIP output with chunking
+- Dry-run mode
+- Safety limits
+- Multiple source files
+"""
+
 import os
 import sys
 import shutil
+import json
 import zipfile
 import uuid
-import json
-from concurrent.futures import ThreadPoolExecutor
-from itertools import islice
+import argparse
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ---------------- Utils ----------------
-def ask(prompt, help_text=None, default=None):
-    if help_text:
-        print(f"\nℹ️  {help_text}")
-    value = input(f"{prompt} ")
-    if not value and default is not None:
-        return default
-    return value
+RESUME_FILE = ".resume_state.json"
 
-def error(msg):
-    print(f"\n❌ ERROR: {msg}")
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
-def to_bool(v):
-    return v.lower() in ["y", "yes", "true", "1"]
 
-def chunked(iterable, size):
-    it = iter(iterable)
-    while True:
-        chunk = list(islice(it, size))
-        if not chunk:
-            return
-        yield chunk
+def is_positive_int(value):
+    try:
+        iv = int(value)
+        return iv >= 0
+    except Exception:
+        return False
 
-# ---------------- Interactive Inputs ----------------
-print("\n=== 📁 File Duplication Tool (Pure Python) ===")
 
-source_files = ask(
-    "Source files (comma-separated paths):",
-    "Example: demo-file/countries.json, assets/config.yaml",
-)
+def load_resume(output_dir):
+    path = output_dir / RESUME_FILE
+    if path.exists():
+        with open(path, "r") as f:
+            return set(json.load(f))
+    return set()
 
-sources = [s.strip() for s in source_files.split(",") if s.strip()]
-if not sources:
-    error("No source files provided")
 
-for src in sources:
-    if not os.path.isfile(src):
-        error(f"File not found: {src}")
+def save_resume(output_dir, completed):
+    path = output_dir / RESUME_FILE
+    with open(path, "w") as f:
+        json.dump(sorted(completed), f)
 
-copies = ask(
-    "How many copies per source file?",
-    "Must be a number > 0",
-)
-if not copies.isdigit() or int(copies) <= 0:
-    error("Invalid copies value")
-copies = int(copies)
 
-target_folder = ask(
-    "Target output folder name:",
-    "Folder will be created if it doesn't exist",
-)
+# -----------------------------
+# File generation
+# -----------------------------
+def copy_one(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return dst.name
 
-per_subfolder = ask(
-    "Files per subfolder (0 = no subfolders):",
-    "Example: 5000",
-    default="0",
-)
-if not per_subfolder.isdigit():
-    error("per_subfolder must be numeric")
-per_subfolder = int(per_subfolder)
 
-workers = ask(
-    "Parallel workers:",
-    "Recommended: CPU cores (e.g. 4 or 8)",
-    default="4",
-)
-if not workers.isdigit() or int(workers) <= 0:
-    error("Invalid worker count")
-workers = int(workers)
+def generate_files(
+    sources,
+    copies,
+    output_dir,
+    per_subfolder,
+    workers,
+    dry_run,
+    resume,
+    randomize,
+    max_limit,
+):
+    completed = load_resume(output_dir) if resume else set()
+    tasks = []
 
-dry_run = to_bool(
-    ask("Dry run? (y/n):", "No files will be written", default="n")
-)
+    total = len(sources) * copies
+    if total > max_limit:
+        die(f"Requested {total} files exceeds limit {max_limit}")
 
-resume_mode = to_bool(
-    ask("Resume mode? (y/n):", "Skips already created files", default="y")
-)
+    for src in sources:
+        src = Path(src)
+        if not src.exists():
+            die(f"Source not found: {src}")
 
-randomize = to_bool(
-    ask("Randomize filenames? (y/n):", "Uses UUID filenames", default="n")
-)
+        stem = src.stem
+        suffix = src.suffix
 
-zip_output = to_bool(
-    ask("Create ZIP output? (y/n):", "Creates zip files at the end", default="y")
-)
-
-chunk_size = ask(
-    "ZIP chunk size:",
-    "Files per zip (default 5000)",
-    default="5000",
-)
-if not chunk_size.isdigit():
-    error("chunk_size must be numeric")
-chunk_size = int(chunk_size)
-
-max_limit = ask(
-    "Maximum allowed total files:",
-    "Safety limit (default 50000)",
-    default="50000",
-)
-if not max_limit.isdigit():
-    error("max_limit must be numeric")
-max_limit = int(max_limit)
-
-# ---------------- Limits ----------------
-total_files = copies * len(sources)
-if total_files > max_limit:
-    error(f"Requested {total_files} files exceeds limit {max_limit}")
-
-print(f"\n📊 Total files to generate: {total_files}")
-
-# ---------------- Resume ----------------
-os.makedirs(target_folder, exist_ok=True)
-STATE_FILE = os.path.join(target_folder, ".resume_state.json")
-completed = set()
-
-if resume_mode and os.path.exists(STATE_FILE):
-    with open(STATE_FILE) as f:
-        completed = set(json.load(f))
-    print(f"🔁 Resume enabled — {len(completed)} files already done")
-
-# ---------------- Build Tasks ----------------
-tasks = []
-
-for src in sources:
-    base = os.path.basename(src)
-    name, ext = os.path.splitext(base)
-
-    for i in range(1, copies + 1):
-        folder = target_folder
-        if per_subfolder > 0:
-            folder = os.path.join(
-                target_folder, f"part_{((i - 1) // per_subfolder) + 1}"
+        for i in range(1, copies + 1):
+            name = (
+                f"{stem}_{uuid.uuid4().hex}{suffix}"
+                if randomize
+                else f"{stem}_{i}{suffix}"
             )
 
-        os.makedirs(folder, exist_ok=True)
+            if name in completed:
+                continue
 
-        filename = (
-            f"{uuid.uuid4().hex}{ext}"
-            if randomize
-            else f"{name}_{i}{ext}"
-        )
+            if per_subfolder > 0:
+                idx = (i - 1) // per_subfolder + 1
+                dst = output_dir / f"part_{idx}" / name
+            else:
+                dst = output_dir / name
 
-        dest = os.path.join(folder, filename)
+            tasks.append((src, dst, name))
 
-        if resume_mode and dest in completed:
-            continue
+    if dry_run:
+        print(f"[DRY-RUN] Would generate {len(tasks)} files")
+        return completed
 
-        tasks.append((src, dest))
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futures = {
+            exe.submit(copy_one, src, dst): name
+            for src, dst, name in tasks
+        }
 
-# ---------------- Copy ----------------
-def copy_task(task):
-    src, dest = task
-    if not dry_run:
-        shutil.copy2(src, dest)
-    completed.add(dest)
+        with tqdm(total=len(futures), unit="file") as bar:
+            for fut in as_completed(futures):
+                name = futures[fut]
+                fut.result()
+                completed.add(name)
+                bar.update(1)
 
-with ThreadPoolExecutor(max_workers=workers) as executor:
-    list(
-        tqdm(
-            executor.map(copy_task, tasks),
-            total=len(tasks),
-            desc="Generating files",
-            unit="files",
-        )
+    if resume:
+        save_resume(output_dir, completed)
+
+    return completed
+
+
+# -----------------------------
+# ZIP chunking
+# -----------------------------
+def zip_chunks(output_dir, chunk_size):
+    files = sorted(
+        p for p in output_dir.rglob("*")
+        if p.is_file() and p.name != RESUME_FILE
     )
 
-if resume_mode and not dry_run:
-    with open(STATE_FILE, "w") as f:
-        json.dump(list(completed), f)
+    if not files:
+        return
 
-# ---------------- ZIP ----------------
-if zip_output and not dry_run:
-    all_files = []
-    for root, _, files in os.walk(target_folder):
-        for f in files:
-            if not f.endswith(".json"):
-                all_files.append(os.path.join(root, f))
+    for i in range(0, len(files), chunk_size):
+        zip_name = f"{output_dir.name}_part{i//chunk_size+1}.zip"
+        zip_path = output_dir.parent / zip_name
 
-    for idx, chunk in enumerate(chunked(all_files, chunk_size), start=1):
-        zip_name = f"{target_folder}_part{idx}.zip"
-        with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
-            for file in chunk:
-                z.write(file, arcname=os.path.relpath(file, target_folder))
-        print(f"📦 Created {zip_name}")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in files[i:i + chunk_size]:
+                z.write(f, f.relative_to(output_dir))
 
-print("\n✅ DONE")
+
+# -----------------------------
+# Interactive prompts
+# -----------------------------
+def prompt(msg, validator=None, default=None):
+    while True:
+        v = input(f"{msg} [{default}]: " if default else f"{msg}: ").strip()
+        if not v and default is not None:
+            return default
+        if validator is None or validator(v):
+            return v
+        print("Invalid value, try again.")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Duplicate files at scale")
+    parser.add_argument("--sources", help="Comma-separated source files")
+    parser.add_argument("--copies", type=int, help="Copies per source")
+    parser.add_argument("--output", help="Output directory")
+    parser.add_argument("--per-subfolder", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--randomize", action="store_true")
+    parser.add_argument("--zip", action="store_true")
+    parser.add_argument("--chunk-size", type=int, default=5000)
+    parser.add_argument("--max-limit", type=int, default=50000)
+
+    args = parser.parse_args()
+
+    # Interactive fallback
+    if not args.sources:
+        args.sources = prompt(
+            "Source file(s) (comma-separated)", lambda x: True
+        )
+        args.copies = int(prompt("Copies per source", is_positive_int))
+        args.output = prompt("Output directory")
+        args.per_subfolder = int(prompt("Files per subfolder (0 = none)", is_positive_int, 0))
+        args.workers = int(prompt("Parallel workers", is_positive_int, 4))
+        args.dry_run = prompt("Dry-run? (y/n)", lambda x: x.lower() in ["y", "n"], "n") == "y"
+        args.resume = prompt("Resume mode? (y/n)", lambda x: x.lower() in ["y", "n"], "n") == "y"
+        args.randomize = prompt("Randomize filenames? (y/n)", lambda x: x.lower() in ["y", "n"], "n") == "y"
+        args.zip = prompt("Zip output? (y/n)", lambda x: x.lower() in ["y", "n"], "n") == "y"
+        args.chunk_size = int(prompt("ZIP chunk size", is_positive_int, 5000))
+        args.max_limit = int(prompt("Max safety limit", is_positive_int, 50000))
+
+    sources = [s.strip() for s in args.sources.split(",")]
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    completed = generate_files(
+        sources=sources,
+        copies=args.copies,
+        output_dir=output_dir,
+        per_subfolder=args.per_subfolder,
+        workers=args.workers,
+        dry_run=args.dry_run,
+        resume=args.resume,
+        randomize=args.randomize,
+        max_limit=args.max_limit,
+    )
+
+    if args.zip and not args.dry_run:
+        zip_chunks(output_dir, args.chunk_size)
+
+    print(f"SUCCESS: {len(completed)} files processed")
+
+
+if __name__ == "__main__":
+    main()
